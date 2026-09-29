@@ -162,6 +162,9 @@ class StaticFiles:
     def lookup_path(
         self, path: str
     ) -> typing.Tuple[str, typing.Optional[os.stat_result]]:
+        # Reject absolute paths so they cannot escape the served directory.
+        if path.startswith(("/", "\\")):
+            return "", None
         for directory in self.all_directories:
             joined_path = os.path.join(directory, path)
             if self.follow_symlink:

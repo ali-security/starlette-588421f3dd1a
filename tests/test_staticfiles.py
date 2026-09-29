@@ -2,6 +2,7 @@ import os
 import stat
 import tempfile
 import time
+import typing
 from pathlib import Path
 
 import anyio
@@ -548,3 +549,82 @@ def test_staticfiles_avoids_path_traversal(tmp_path: Path):
 
     assert exc_info.value.status_code == 404
     assert exc_info.value.detail == "Not Found"
+
+
+def test_staticfiles_rejects_absolute_paths(tmp_path: Path) -> None:
+    statics_path = tmp_path / "static"
+    statics_path.mkdir()
+    app = StaticFiles(directory=statics_path)
+
+    full_path, stat_result = app.lookup_path("/etc/passwd")
+    assert full_path == ""
+    assert stat_result is None
+
+
+def test_staticfiles_rejects_absolute_windows_paths(tmp_path: Path) -> None:
+    statics_path = tmp_path / "static"
+    statics_path.mkdir()
+    app = StaticFiles(directory=statics_path)
+
+    full_path, stat_result = app.lookup_path("\\\\server\\share")
+    assert full_path == ""
+    assert stat_result is None
+
+
+def test_staticfiles_absolute_paths_never_reach_the_filesystem(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An attacker-supplied UNC path is absolute on Windows, so `os.path.join`
+    # drops the served directory and `os.path.realpath` opens an outbound SMB
+    # connection to resolve the host - leaking the service account credentials
+    # - before the containment check gets a chance to reject the path.
+    statics_path = tmp_path / "static"
+    statics_path.mkdir()
+    app = StaticFiles(directory=statics_path)
+
+    realpath = os.path.realpath
+    realpath_calls = 0
+
+    def spy(path: typing.Any, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        nonlocal realpath_calls
+        realpath_calls += 1
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", spy)
+
+    assert app.lookup_path("\\\\attacker.com\\share") == ("", None)
+    assert app.lookup_path("//attacker.com/share") == ("", None)
+    assert app.lookup_path("/etc/passwd") == ("", None)
+    assert realpath_calls == 0
+
+    # Relative paths are still resolved against the served directory.
+    assert app.lookup_path("index.html") == ("", None)
+    assert realpath_calls > 0
+
+
+def test_staticfiles_unc_request_path_never_reaches_realpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `GET /\\attacker.com\share` - the backslashes survive `get_path`, so the
+    # request must be rejected before `os.path.realpath` resolves the UNC host.
+    statics_path = tmp_path / "static"
+    statics_path.mkdir()
+    app = StaticFiles(directory=statics_path, html=True)
+
+    realpath = os.path.realpath
+    realpath_args: typing.List[typing.Any] = []
+
+    def spy(path: typing.Any, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        realpath_args.append(path)
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", spy)
+
+    path = app.get_path({"path": "/\\\\attacker.com\\share"})
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, path, {"method": "GET"})
+
+    assert exc_info.value.status_code == 404
+    assert not any("attacker.com" in str(arg) for arg in realpath_args)
