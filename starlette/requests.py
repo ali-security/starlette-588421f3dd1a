@@ -249,6 +249,7 @@ class Request(HTTPConnection):
         *,
         max_files: typing.Union[int, float] = 1000,
         max_fields: typing.Union[int, float] = 1000,
+        max_part_size: int = 1024 * 1024,
     ) -> FormData:
         if self._form is None:
             assert (
@@ -271,8 +272,18 @@ class Request(HTTPConnection):
                         raise HTTPException(status_code=400, detail=exc.message)
                     raise exc
             elif content_type == b"application/x-www-form-urlencoded":
-                form_parser = FormParser(self.headers, self.stream())
-                self._form = await form_parser.parse()
+                try:
+                    form_parser = FormParser(
+                        self.headers,
+                        self.stream(),
+                        max_fields=max_fields,
+                        max_part_size=max_part_size,
+                    )
+                    self._form = await form_parser.parse()
+                except MultiPartException as exc:
+                    if "app" in self.scope:
+                        raise HTTPException(status_code=400, detail=exc.message)
+                    raise exc
             else:
                 self._form = FormData()
         return self._form
@@ -282,9 +293,14 @@ class Request(HTTPConnection):
         *,
         max_files: typing.Union[int, float] = 1000,
         max_fields: typing.Union[int, float] = 1000,
+        max_part_size: int = 1024 * 1024,
     ) -> AwaitableOrContextManager[FormData]:
         return AwaitableOrContextManagerWrapper(
-            self._get_form(max_files=max_files, max_fields=max_fields)
+            self._get_form(
+                max_files=max_files,
+                max_fields=max_fields,
+                max_part_size=max_part_size,
+            )
         )
 
     async def close(self) -> None:

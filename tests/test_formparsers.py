@@ -9,7 +9,9 @@ from unittest import mock
 import pytest
 
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.formparsers import (
+    FormParser,
     MultiPartException,
     MultiPartParser,
     UploadFile,
@@ -123,10 +125,18 @@ async def app_monitor_thread(scope, receive, send):
     await response(scope, receive, send)
 
 
-def make_app_max_parts(max_files: int = 1000, max_fields: int = 1000):
+def make_app_max_parts(
+    max_files: int = 1000,
+    max_fields: int = 1000,
+    max_part_size: int = 1024 * 1024,
+):
     async def app(scope, receive, send):
         request = Request(scope, receive)
-        data = await request.form(max_files=max_files, max_fields=max_fields)
+        data = await request.form(
+            max_files=max_files,
+            max_fields=max_fields,
+            max_part_size=max_part_size,
+        )
         output: typing.Dict[str, typing.Any] = {}
         for key, value in data.items():
             if isinstance(value, UploadFile):
@@ -496,6 +506,145 @@ def test_multipart_multi_field_app_reads_body(tmpdir, test_client_factory):
         "/", data={"some": "data", "second": "key pair"}, files=FORCE_MULTIPART
     )
     assert response.json() == {"some": "data", "second": "key pair"}
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (app, pytest.raises(MultiPartException)),
+        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
+    ],
+)
+def test_urlencoded_too_many_fields_raise(app, expectation, test_client_factory):
+    client = test_client_factory(app)
+    data = "&".join(f"N{i}=" for i in range(1001))
+    with expectation:
+        res = client.post(
+            "/",
+            content=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert res.status_code == 400
+        assert res.text == "Too many fields. Maximum number of fields is 1000."
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (app, pytest.raises(MultiPartException)),
+        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
+    ],
+)
+def test_urlencoded_field_exceeds_max_part_size_raise(
+    app, expectation, test_client_factory
+):
+    client = test_client_factory(app)
+    data = "field=" + "x" * (1024 * 1024 + 1)
+    with expectation:
+        res = client.post(
+            "/",
+            content=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert res.status_code == 400
+        assert res.text == "Field exceeded maximum size of 1024KB."
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (app, pytest.raises(MultiPartException)),
+        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
+    ],
+)
+def test_urlencoded_field_name_exceeds_max_part_size_raise(
+    app, expectation, test_client_factory
+):
+    client = test_client_factory(app)
+    data = "x" * (1024 * 1024 + 1) + "=value"
+    with expectation:
+        res = client.post(
+            "/",
+            content=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert res.status_code == 400
+        assert res.text == "Field exceeded maximum size of 1024KB."
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (make_app_max_parts(max_fields=1), pytest.raises(MultiPartException)),
+        (
+            Starlette(routes=[Mount("/", app=make_app_max_parts(max_fields=1))]),
+            does_not_raise(),
+        ),
+    ],
+)
+def test_urlencoded_max_fields_is_customizable(app, expectation, test_client_factory):
+    client = test_client_factory(app)
+    with expectation:
+        res = client.post(
+            "/",
+            content="a=1&b=2",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert res.status_code == 400
+        assert res.text == "Too many fields. Maximum number of fields is 1."
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (
+            make_app_max_parts(max_part_size=1024 * 10),
+            pytest.raises(MultiPartException),
+        ),
+        (
+            Starlette(
+                routes=[Mount("/", app=make_app_max_parts(max_part_size=1024 * 10))]
+            ),
+            does_not_raise(),
+        ),
+    ],
+)
+def test_urlencoded_max_part_size_is_customizable(
+    app, expectation, test_client_factory
+):
+    client = test_client_factory(app)
+    with expectation:
+        res = client.post(
+            "/",
+            content="field=" + "x" * (1024 * 10 + 1),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert res.status_code == 400
+        assert res.text == "Field exceeded maximum size of 10KB."
+
+
+@pytest.mark.anyio
+async def test_urlencoded_limits_stop_parsing_within_a_single_chunk():
+    async def single_chunk(body):
+        yield body
+
+    headers = Headers({"content-type": "application/x-www-form-urlencoded"})
+
+    too_many = "&".join(f"f{i}=" for i in range(100_000)).encode()
+    stream = single_chunk(too_many)
+    parser = FormParser(headers, stream, max_fields=10)
+    with pytest.raises(MultiPartException, match="Too many fields"):
+        await parser.parse()
+    await stream.aclose()
+    assert parser._current_fields == 11
+
+    too_big = ("field=" + "x" * (1024 * 1024 * 50)).encode()
+    stream = single_chunk(too_big)
+    parser = FormParser(headers, stream, max_part_size=1024)
+    with pytest.raises(MultiPartException, match="Field exceeded maximum size"):
+        await parser.parse()
+    await stream.aclose()
+    assert sum(len(data) for _, data in parser.messages) <= 1024
 
 
 def test_user_safe_decode_helper():
