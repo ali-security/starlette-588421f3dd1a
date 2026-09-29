@@ -1,11 +1,20 @@
 import os
+import threading
 import typing
 from contextlib import nullcontext as does_not_raise
+from io import BytesIO
+from tempfile import SpooledTemporaryFile
+from unittest import mock
 
 import pytest
 
 from starlette.applications import Starlette
-from starlette.formparsers import MultiPartException, UploadFile, _user_safe_decode
+from starlette.formparsers import (
+    MultiPartException,
+    MultiPartParser,
+    UploadFile,
+    _user_safe_decode,
+)
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
@@ -95,6 +104,22 @@ async def app_read_body(scope, receive, send):
         output[key] = value
     await request.close()
     response = JSONResponse(output)
+    await response(scope, receive, send)
+
+
+async def app_monitor_thread(scope, receive, send):
+    """Helper app to monitor what thread the app was called on.
+
+    This can later be used to validate thread/event loop operations.
+    """
+    request = Request(scope, receive)
+
+    # Make sure we parse the form
+    await request.form()
+    await request.close()
+
+    # Send back the current thread id
+    response = JSONResponse({"thread_ident": threading.current_thread().ident})
     await response(scope, receive, send)
 
 
@@ -301,6 +326,60 @@ def test_multipart_request_mixed_files_and_data(tmpdir, test_client_factory):
         "field0": "value0",
         "field1": "value1",
     }
+
+
+if typing.TYPE_CHECKING:
+    _SpooledTemporaryFileBase = SpooledTemporaryFile[bytes]
+else:
+    # `SpooledTemporaryFile` is not subscriptable at runtime on older Pythons.
+    _SpooledTemporaryFileBase = SpooledTemporaryFile
+
+
+class ThreadTrackingSpooledTemporaryFile(_SpooledTemporaryFileBase):
+    """Helper class to track which threads performed the rollover operation.
+
+    This is not threadsafe/multi-test safe.
+    """
+
+    rollover_threads: typing.ClassVar[typing.Set[typing.Optional[int]]] = set()
+
+    def rollover(self) -> None:
+        ThreadTrackingSpooledTemporaryFile.rollover_threads.add(
+            threading.current_thread().ident
+        )
+        super().rollover()
+
+
+@pytest.fixture
+def mock_spooled_temporary_file() -> typing.Generator[None, None, None]:
+    try:
+        with mock.patch(
+            "starlette.formparsers.SpooledTemporaryFile",
+            ThreadTrackingSpooledTemporaryFile,
+        ):
+            yield
+    finally:
+        ThreadTrackingSpooledTemporaryFile.rollover_threads.clear()
+
+
+def test_multipart_request_large_file_rollover_in_background_thread(
+    mock_spooled_temporary_file, test_client_factory
+):
+    """Test that Spooled file rollovers happen in background threads."""
+    data = BytesIO(b" " * (MultiPartParser.max_file_size + 1))
+
+    client = test_client_factory(app_monitor_thread)
+    response = client.post("/", files=[("test_large", data)])
+    assert response.status_code == 200
+
+    # Parse the event thread id from the API response and ensure we have one
+    app_thread_ident = response.json().get("thread_ident")
+    assert app_thread_ident is not None
+
+    # Ensure the app thread was not the same as the rollover one and that a
+    # rollover thread exists
+    assert app_thread_ident not in ThreadTrackingSpooledTemporaryFile.rollover_threads
+    assert len(ThreadTrackingSpooledTemporaryFile.rollover_threads) == 1
 
 
 def test_multipart_request_with_charset_for_filename(tmpdir, test_client_factory):
