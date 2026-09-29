@@ -43,6 +43,43 @@ def test_http_endpoint_route_method(client):
     assert response.headers["allow"] == "GET"
 
 
+def test_http_endpoint_route_head_falls_back_to_get(client):
+    response = client.head("/")
+    assert response.status_code == 200
+
+
+def test_http_endpoint_does_not_dispatch_non_verb_method(test_client_factory):
+    class Endpoint(HTTPEndpoint):
+        async def get(self, request):
+            return PlainTextResponse("Hello, world!")  # pragma: no cover
+
+        async def _do_delete(self, request):
+            return PlainTextResponse("Privileged helper")  # pragma: no cover
+
+    app = Router(routes=[Route("/", endpoint=Endpoint)])
+    client = test_client_factory(app)
+
+    response = client.request("_DO_DELETE", "/")
+    assert response.status_code == 405
+    assert response.text == "Method Not Allowed"
+    assert response.headers["allow"] == "GET"
+
+
+def test_http_endpoint_does_not_dispatch_internal_attribute(test_client_factory):
+    class Endpoint(HTTPEndpoint):
+        async def get(self, request):
+            return PlainTextResponse("Hello, world!")  # pragma: no cover
+
+    app = Router(routes=[Route("/", endpoint=Endpoint)])
+    client = test_client_factory(app)
+
+    for method in ("DISPATCH", "METHOD_NOT_ALLOWED", "SCOPE"):
+        response = client.request(method, "/")
+        assert response.status_code == 405
+        assert response.text == "Method Not Allowed"
+        assert response.headers["allow"] == "GET"
+
+
 def test_websocket_endpoint_on_connect(test_client_factory):
     class WebSocketApp(WebSocketEndpoint):
         async def on_connect(self, websocket):

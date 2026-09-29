@@ -34,9 +34,13 @@ class HTTPEndpoint:
             else request.method.lower()
         )
 
-        handler: typing.Callable[[Request], typing.Any] = getattr(
-            self, handler_name, self.method_not_allowed
-        )
+        handler: typing.Callable[[Request], typing.Any]
+        if request.method in self._allowed_methods or (
+            request.method == "HEAD" and "GET" in self._allowed_methods
+        ):
+            handler = getattr(self, handler_name)
+        else:
+            handler = self.method_not_allowed
         is_async = is_async_callable(handler)
         if is_async:
             response = await handler(request)
