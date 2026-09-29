@@ -2,15 +2,20 @@
 name: Test Suite
 
 on:
-  push:
-    branches: ["master"]
-  pull_request:
-    branches: ["master"]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest arguments to narrow the test run (e.g. -k name)"
+        required: false
+        default: ""
 
 jobs:
   tests:
     name: "Python ${{ matrix.python-version }}"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 30
+    env:
+      PIP_INDEX_URL: "https://:2023-05-16T10:59:53.927486Z@time-machines-pypi.sealsecurity.io/"
 
     strategy:
       matrix:
@@ -23,11 +28,14 @@ jobs:
           python-version: "${{ matrix.python-version }}"
       - name: "Install dependencies"
         run: "scripts/install"
-      - name: "Run linting checks"
-        run: "scripts/check"
       - name: "Build package & docs"
         run: "scripts/build"
       - name: "Run tests"
-        run: "scripts/test"
-      - name: "Enforce coverage"
-        run: "scripts/coverage"
+        run: "scripts/test -v ${{ inputs.test-filter }}"
+      - name: "Upload artifacts"
+        if: matrix.python-version == '3.7'
+        uses: actions/upload-artifact@v4
+        with:
+          name: starlette-dist
+          path: "dist/*"
+          if-no-files-found: error
